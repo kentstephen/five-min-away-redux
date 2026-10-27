@@ -470,3 +470,27 @@ def pack(bld: gpd.GeoDataFrame, rgba: np.ndarray, names: bool = True) -> bytes:
 def places_json(iso: pd.DataFrame) -> str:
     """The places as the page needs them for lighting points: [[lon, lat, name], ...] in `poi_ids` order."""
     return json.dumps([[round(float(x), 6), round(float(y), 6), str(n)] for x, y, n in zip(iso["lon"], iso["lat"], iso["name"].fillna(""))])
+
+
+def selection_parquet(iso: pd.DataFrame, routes: list[dict], nta_name: str = "") -> bytes:
+    """A parquet file (snappy, so the browser can read it with hyparquet) of the places that reach one building: the
+    places' Overture columns joined in DuckDB with the route numbers, one row per place, nearest first."""
+    import io
+
+    import pyarrow.parquet as pq
+
+    sel = pd.DataFrame({"id": iso["id"].astype(str).to_numpy(), "i": np.arange(len(iso), dtype=np.int32)})
+    rt = pd.DataFrame({"i": [r["i"] for r in routes], "minutes": [round(r["minutes"], 1) for r in routes], "meters": [int(round(r["meters"])) for r in routes]}, columns=["i", "minutes", "meters"])
+    con = connection()
+    con.register("sel", sel)
+    con.register("rt", rt)
+    t = con.sql(
+        f"""SELECT p.name, p.category, rt.minutes, rt.meters, round(p.confidence, 2) AS confidence, p.basic_category, p.lon, p.lat, p.id
+            FROM sel JOIN read_parquet('{places_path()}') p ON p.id = sel.id LEFT JOIN rt ON rt.i = sel.i
+            ORDER BY rt.minutes NULLS LAST, p.name"""
+    ).to_arrow_table()
+    con.unregister("sel")
+    con.unregister("rt")
+    buf = io.BytesIO()
+    pq.write_table(t, buf, compression="snappy")
+    return buf.getvalue()

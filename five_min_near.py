@@ -6,6 +6,7 @@ app = marimo.App(width="full")
 
 @app.cell
 def _():
+    import base64
     import json
     import pathlib
 
@@ -16,11 +17,11 @@ def _():
 
     import fivemin
 
-    return anywidget, fivemin, json, mo, np, pathlib, traitlets
+    return anywidget, base64, fivemin, json, mo, np, pathlib, traitlets
 
 
 @app.cell
-def _(anywidget, fivemin, json, mo, pathlib, traitlets):
+def _(anywidget, base64, fivemin, json, mo, pathlib, traitlets):
     class FiveMap(anywidget.AnyWidget):
         """The page, flat: MapLibre + deck.gl map of the building footprints (GeoArrow polygons colored by how many
         places reach them). Hovering a building dims the others and lights the places that reach it as points; a click
@@ -59,11 +60,17 @@ def _(anywidget, fivemin, json, mo, pathlib, traitlets):
             return
         row = bld.iloc[fid]
         c = row.geometry.representative_point()
+        sel = iso.iloc[list(row["poi_ids"])]
         try:
-            rts = fivemin.routes((c.x, c.y), iso.iloc[list(row["poi_ids"])], costing, bid=str(row["id"]), log=lambda *_: None)
+            rts = fivemin.routes((c.x, c.y), sel, costing, bid=str(row["id"]), log=lambda *_: None)
         except Exception:  # the router threw: answer with no routes so the page stops waiting
             rts = []
-        widget.send({"pin": fid, "routes": rts})
+        # the places as a parquet file (base64 in the message) for the table on the page
+        try:
+            table = base64.b64encode(fivemin.selection_parquet(sel, rts)).decode("ascii")
+        except Exception:
+            table = ""
+        widget.send({"pin": fid, "routes": rts, "table": table})
 
     page.widget.on_msg(_on_msg)
     return FiveMap, HOME, STATE, page

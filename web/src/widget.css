@@ -53,3 +53,15 @@
 .fm .ptip span { color: #f0c040; }
 .fm .foot .nb { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .fm .foot .nb input { margin: 0; accent-color: #d9f3a7; }
+
+/* the panel on the right while a building is locked: the headline, the routes line, the table of the places */
+.fm .side { position: absolute; top: 14px; right: 14px; bottom: 30px; z-index: 6; width: min(560px, calc(100vw - 320px)); display: none; flex-direction: column; padding: 12px 14px 12px; }
+.fm .side.on { display: flex; }
+.fm .side .head .n { font-size: 24px; font-weight: 600; line-height: 1.1; letter-spacing: -0.01em; }
+.fm .side .head .n small { font-size: 12.5px; font-weight: 400; color: #8d9aa3; margin-left: 6px; letter-spacing: 0; }
+.fm .side .head .routes { margin-top: 6px; font-size: 11.5px; color: #d9f3a7; }
+.fm .side .head .hint { margin: 4px 0 10px; font-size: 10.5px; color: #8d9aa3; }
+.fm .side .ht { flex: 1; min-height: 0; display: flex; flex-direction: column; font-size: 12px; border-radius: 6px; overflow: hidden; }
+.fm .side .ht > div { flex: 1; min-height: 0; --hy-color-1: #e6ecef; --hy-color-2: #c9d2d8; --hy-color-3: #8d9aa3; --hy-color-5: #3a4650; --hy-color-7: #2a333b;
+  --hy-color-8: #222a31; --hy-color-9: #151b20; --hy-color-10: #0e1317; --hy-accent-1: #d9f3a7; --hy-accent-2: #9fc77c; --hy-accent-3: #2c3a2a; --hy-accent-4: #1d2a1e; --hy-accent-5: #1a241a;
+  --hy-highlight-1: #2e3a1c; --hy-highlight-2: #27311a; --cell-busy-background: linear-gradient(60deg, rgba(255,255,255,.04) 25%, rgba(255,255,255,.07) 50%, rgba(255,255,255,.04) 75%); }

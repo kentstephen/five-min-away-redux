@@ -14,6 +14,11 @@ import { MapLibreOverlay } from "@deck.gl/maplibre";
 import { GeoArrowPolygonLayer } from "@geoarrow/deck.gl-layers";
 import { PathLayer, PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
 import * as arrow from "apache-arrow";
+import { createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import HighTable, { arrayDataFrame, sortableDataFrame } from "hightable";
+import htCss from "hightable/src/HighTable.css?inline";
+import { parquetReadObjects } from "hyparquet";
 import css from "./widget.css?inline";
 
 type Model = {
@@ -46,7 +51,7 @@ const NAMES_SHOWN = 14;
 
 function render({ model, el }: { model: Model; el: HTMLElement }) {
   const sheet = document.createElement("style");
-  sheet.textContent = maplibreCss + "\n" + css;
+  sheet.textContent = maplibreCss + "\n" + htCss + "\n" + css;
   el.appendChild(sheet);
   if (!document.getElementById("fm-font")) {
     const l = document.createElement("link"); l.id = "fm-font"; l.rel = "stylesheet";
@@ -78,6 +83,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
     </div>
     <div class="tip glass"></div>
     <div class="ptip glass"></div>
+    <div class="side glass"><div class="head"></div><div class="ht"></div></div>
     <div class="attrib">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> © <a href="https://carto.com/" target="_blank" rel="noopener">CARTO</a>, Overture Maps</div>`;
   el.appendChild(root);
   const $ = <T extends HTMLElement = HTMLElement>(c: string) => root.querySelector(c) as T;
@@ -149,6 +155,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   const overlay = new MapLibreOverlay({ interleaved: true, layers: [] });
   map.addControl(overlay as unknown as maplibregl.IControl);
   new ResizeObserver(() => map.resize()).observe($(".map"));
+  new ResizeObserver(() => root.style.setProperty("--card-h", `${$(".card").offsetHeight}px`)).observe($(".card"));
 
   let table: arrow.Table | null = null;
   let batch: arrow.RecordBatch | null = null;
@@ -208,11 +215,30 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
       `<ul class="names">${shown.map((s) => `<li>${esc(s)}</li>`).join("")}${more > 0 ? `<li class="more">and ${more} more</li>` : ""}</ul>` +
       (rt ? `<div class="routes">${esc(rt)}</div>` : "") +
       (pinned === null ? `<div class="hint">${extruded ? "E to flatten, then click to lock" : c.flat ? "click to lock and draw the routes" : "click to keep"}</div>` : `<div class="hint">click again or Esc to release</div>`);
+    if (pinned !== null) {
+      // locked: everything moves to the panel on the right; the hover tooltip goes away
+      hideTip();
+      side.classList.add("on");
+      $(".side .head").innerHTML =
+        `<div class="n">${n}<small>${esc(unit)} within a ${c.minutes ?? 5} minute ${(model.get("costing") as string) === "bicycle" ? "bike ride" : "walk"}${where}</small></div>` +
+        (rt ? `<div class="routes">${esc(rt)}</div>` : "") + `<div class="hint">click anywhere or Esc to release</div>`;
+      return;
+    }
     tip.classList.add("on");
-    tip.classList.toggle("pinned", pinned !== null);
+    tip.classList.remove("pinned");
     place(x, y);
   };
   const hideTip = () => { tip.classList.remove("on", "pinned"); };
+  const side = $(".side");
+  let htRoot: Root | null = null;
+  const showTable = async (b64: string) => {
+    const bin = atob(b64), buf = new ArrayBuffer(bin.length), u = new Uint8Array(buf);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    const rows = await parquetReadObjects({ file: { byteLength: buf.byteLength, slice: (a: number, b?: number) => buf.slice(a, b) } });
+    if (!htRoot) htRoot = createRoot($(".side .ht"));
+    htRoot.render(createElement(HighTable, { data: sortableDataFrame(arrayDataFrame(rows)), cacheKey: "fm-places", focus: false, onError: console.error } as never));
+  };
+  const hideSide = () => { side.classList.remove("on"); if (htRoot) { htRoot.unmount(); htRoot = null; } };
   // the small tooltip on a place ring while a building is locked: the name, the route's minutes and distance
   const ptip = $(".ptip");
   const showPlace = (k: number, x: number, y: number) => {
@@ -368,13 +394,14 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
     routes = []; routesFor = null;
     try { model.send({ pin: fid }); } catch (e) { console.error("five-min: could not ask for routes", e); }
   };
-  const release = () => { pinned = null; routes = []; routesFor = null; hotPlace = null; hidePlace(); hideTip(); setHot(null); try { model.send({ pin: -1 }); } catch { /* no channel */ } };
+  const release = () => { pinned = null; routes = []; routesFor = null; hotPlace = null; hidePlace(); hideTip(); hideSide(); setHot(null); try { model.send({ pin: -1 }); } catch { /* no channel */ } };
   model.on("msg:custom", (msg: unknown) => {
-    const m = msg as { pin?: number; routes?: Route[] } | null;
+    const m = msg as { pin?: number; routes?: Route[]; table?: string } | null;
     if (!m || typeof m.pin !== "number" || !table) return;
     if (pinned === null || col<number>("fid", pinned) !== m.pin) return; // an answer for a building no longer locked
     routes = m.routes || []; routesFor = m.pin;
     if (last) showTip(pinned, last.x, last.y);
+    if (m.table) showTable(m.table).catch((e) => console.error("five-min: could not read the places table", e));
     draw();
   });
   const clicks: unknown[] = [];
@@ -420,7 +447,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
     } catch (e) {
       console.error("five-min: could not read the buildings", e); table = null; batch = null;
     }
-    pinned = null; hot = null; routes = []; routesFor = null; hideTip();
+    pinned = null; hot = null; routes = []; routesFor = null; hideTip(); hideSide();
     draw();
   };
   // the buildings may have been sent before this page existed: if none arrived, ask the kernel once
