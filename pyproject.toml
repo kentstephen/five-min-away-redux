@@ -1,0 +1,22 @@
+[project]
+name = "five-min-away-redux"
+version = "0.1.0"
+description = "Five minute walks to Overture places in Bushwick, Brooklyn: Valhalla isochrones, H3 and buildings."
+requires-python = ">=3.12"
+dependencies = [
+    "marimo>=0.25",
+    "duckdb>=2.0.0",
+    "pyvalhalla>=3.9",
+    "geopandas>=1.0",
+    "shapely>=2.0",
+    "pyarrow>=21",
+    "pandas",
+    "anywidget>=0.9",
+    "lonboard>=0.12",
+    "h3>=4.0",
+    "requests",
+    "playwright",
+]
+
+[tool.uv]
+package = false

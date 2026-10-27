@@ -1,0 +1,45 @@
+:host { display: block; }
+.fm { position: relative; height: 100vh; background: #0b0f14; color: #e6ecef; font-family: "Albert Sans", system-ui, sans-serif; overflow: hidden; }
+.fm.fit { position: fixed; inset: 0; z-index: 9999; }
+.fm .map { position: absolute; inset: 0; }
+.fm .glass { background: rgba(10, 14, 18, 0.78); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px;
+  backdrop-filter: blur(18px) saturate(1.15); -webkit-backdrop-filter: blur(18px) saturate(1.15); box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35); }
+
+/* the card: a title, the sentence that is the controls, the ramp, the count, the keys */
+.fm .card { position: absolute; top: 14px; left: 14px; z-index: 5; width: 272px; max-width: calc(100vw - 28px); padding: 14px 16px 12px; }
+.fm h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.15; }
+.fm .q { margin: 0; font-size: 13.5px; line-height: 1.55; }
+.fm select { appearance: none; -webkit-appearance: none; font: inherit; color: #e6ecef; background: none; border: 0; padding: 0 0 1px; margin: 0; cursor: pointer;
+  border-bottom: 1px solid rgba(217, 243, 167, 0.55); font-weight: 600; field-sizing: content; width: auto; }
+.fm select:hover, .fm select:focus-visible { color: #d9f3a7; border-bottom-color: #d9f3a7; outline: none; }
+.fm .ramp { height: 8px; margin: 14px 0 4px; border-radius: 2px; }
+.fm .ends { display: flex; justify-content: space-between; font-size: 11px; color: #8d9aa3; }
+.fm .foot { display: flex; flex-direction: column; gap: 3px; margin-top: 10px; font-size: 12px; color: #8d9aa3; }
+.fm .foot .hgt { display: flex; align-items: center; gap: 6px; }
+.fm .foot .hgt input[type=range] { flex: 1; min-width: 0; height: 2px; accent-color: #d9f3a7; margin: 0; }
+.fm .foot .hgt input[type=number] { width: 52px; font: inherit; font-size: 12px; color: #e6ecef; background: none; border: 0; border-bottom: 1px solid rgba(255, 255, 255, 0.25); padding: 0 0 1px; text-align: right; -moz-appearance: textfield; }
+.fm .foot .hgt input[type=number]::-webkit-inner-spin-button { opacity: 0.5; }
+.fm .foot .hgt input:focus-visible { outline: none; border-bottom-color: #d9f3a7; }
+.fm .foot .res select { font-weight: 400; color: #8d9aa3; border-bottom-color: rgba(255, 255, 255, 0.25); font-size: 12px; }
+.fm .keys { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.1); font-size: 11px; color: #8d9aa3; }
+.fm .keys span { cursor: pointer; }
+.fm .keys span:hover { color: #e6ecef; }
+.fm .keys b { font-weight: 400; }
+.fm .busy { margin-left: auto; cursor: default; color: #d9f3a7; }
+.fm kbd { font: inherit; font-size: 10px; padding: 0 4px; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 3px; color: #e6ecef; }
+
+/* the tooltip: the count as the headline, the places as a wrapped list; pinned by a click */
+.fm .tip { position: absolute; z-index: 6; width: 280px; padding: 10px 13px 11px; pointer-events: none; display: none; }
+.fm .tip.on { display: block; }
+.fm .tip.pinned { pointer-events: auto; }
+.fm .tip .n { font-size: 24px; font-weight: 600; line-height: 1; letter-spacing: -0.01em; }
+.fm .tip .n small { font-size: 12.5px; font-weight: 400; color: #8d9aa3; margin-left: 6px; letter-spacing: 0; }
+.fm .tip .names { margin: 8px 0 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 3px 10px; font-size: 12px; line-height: 1.4; color: #c9d2d8; }
+.fm .tip .names li { white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.fm .tip .more { color: #8d9aa3; }
+.fm .tip .hint { margin-top: 8px; font-size: 10.5px; color: #8d9aa3; }
+.fm .attrib { position: absolute; right: 8px; bottom: 6px; z-index: 4; font-size: 10px; color: rgba(230, 236, 239, 0.55); }
+.fm .attrib a { color: inherit; }
+
+/* a light basemap: the page's background follows it so the edges do not flash dark on resize */
+.fm.light { background: #e8e6e0; }

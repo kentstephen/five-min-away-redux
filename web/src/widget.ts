@@ -1,0 +1,299 @@
+/** Five Minutes Away: the map (MapLibre + deck.gl, buildings as GeoArrow polygons extruded and colored by how many
+ * places reach them), the card whose sentence is the controls, and our own tooltip on hover / click.
+ *
+ * Traits: category, costing, minutes, resolution (page -> kernel); categories, config (JSON: ramp, vmax, counts, view,
+ * plural), data (Arrow IPC stream: geoarrow.polygon per building part, fid, density int32, names utf8, rgba
+ * FixedSizeList<uint8, 4>, elev float32) (kernel -> page).
+ */
+import * as maplibregl from "maplibre-gl";
+import maplibreCss from "maplibre-gl/dist/maplibre-gl.css?inline";
+// MapLibre 6 loads its worker as a separate module file next to the bundle; marimo serves the bundle alone, so the
+// worker source is inlined and handed over as a blob URL
+import maplibreWorker from "maplibre-gl/dist/maplibre-gl-worker.mjs?raw";
+import { MapLibreOverlay } from "@deck.gl/maplibre";
+import { GeoArrowPolygonLayer } from "@geoarrow/deck.gl-layers";
+import * as arrow from "apache-arrow";
+import css from "./widget.css?inline";
+
+type Model = {
+  get: (k: string) => unknown;
+  set: (k: string, v: unknown) => void;
+  save_changes: () => void;
+  on: (ev: string, cb: () => void) => void;
+  off: (ev: string, cb: () => void) => void;
+};
+type Cfg = { ramp?: string[]; vmax?: number; buildings?: number; places?: number; plural?: string; minutes?: number; area?: string;
+  view?: { lon: number; lat: number; zoom: number; pitch: number; bearing: number }; busy?: boolean };
+
+const STYLES: [string, string][] = [
+  ["dark", "https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json"],
+  ["voyager", "https://basemaps.cartocdn.com/gl/voyager-nolabels-gl-style/style.json"],
+  ["positron", "https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json"],
+];
+const FIT = "fm-fit-on";
+const NAMES_SHOWN = 14;
+
+function render({ model, el }: { model: Model; el: HTMLElement }) {
+  const sheet = document.createElement("style");
+  sheet.textContent = maplibreCss + "\n" + css;
+  el.appendChild(sheet);
+  if (!document.getElementById("fm-font")) {
+    const l = document.createElement("link"); l.id = "fm-font"; l.rel = "stylesheet";
+    l.href = "https://fonts.googleapis.com/css2?family=Albert+Sans:wght@400;600&display=swap"; document.head.appendChild(l);
+  }
+  if (!document.getElementById("fm-fit-style")) {
+    const s = document.createElement("style"); s.id = "fm-fit-style";
+    const hide = ["notebook-actions-dropdown", "cell-actions-button", "drag-button", "expand-output-button", "fullscreen-output-button", "chrome-sidebar", "chrome-footer", "chrome-controls-top-right", "chrome-controls-bottom-right"];
+    s.textContent = hide.map((t) => `html.${FIT} [data-testid='${t}']`).join(",") + `,html.${FIT} div[class*='top-[25vh]']{display:none!important}html.${FIT}{overflow:hidden}`;
+    document.head.appendChild(s);
+  }
+
+  const root = document.createElement("div");
+  root.className = "fm fit";
+  root.innerHTML = `
+    <div class="map"></div>
+    <div class="card glass">
+      <h1>Five minutes away</h1>
+      <p class="q">Buildings in <span class="area">North Brooklyn</span> within a <select class="min"></select> minute
+        <select class="mode"><option value="pedestrian">walk</option><option value="bicycle">bike ride</option></select>
+        of a <select class="cat"></select><span>.</span></p>
+      <div class="ramp"></div>
+      <div class="ends"><span class="lo">1</span><span class="hi"></span></div>
+      <div class="foot"><span class="n"></span><label class="res">cells <select class="resv"></select></label>
+        <label class="hgt">height <input class="hs" type="range" min="0" max="200" step="0.5" value="30"> <input class="hn" type="number" min="0" max="10000" step="0.5" value="30"> ×</label></div>
+      <div class="keys"><span class="kx"><kbd>X</kbd> <b class="xk">notebook</b></span><span class="kf"><kbd>F</kbd> full screen</span>
+        <span class="km"><kbd>M</kbd> <b class="mk">voyager</b></span><span class="kk" title="Shift with the arrow keys turns and tilts the map"><kbd>Shift</kbd> arrows turn, tilt</span><span class="busy"></span></div>
+    </div>
+    <div class="tip glass"></div>
+    <div class="attrib">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> © <a href="https://carto.com/" target="_blank" rel="noopener">CARTO</a>, Overture Maps</div>`;
+  el.appendChild(root);
+  const $ = <T extends HTMLElement = HTMLElement>(c: string) => root.querySelector(c) as T;
+  const cfg = (): Cfg => { try { return JSON.parse((model.get("config") as string) || "{}"); } catch { return {}; } };
+
+  // ---- the card
+  const fill = (sel: HTMLSelectElement, opts: [string | number, string][], cur: unknown) => {
+    sel.innerHTML = opts.map(([v, t]) => `<option value="${v}"${String(v) === String(cur) ? " selected" : ""}>${t}</option>`).join("");
+  };
+  fill($<HTMLSelectElement>(".min"), Array.from({ length: 14 }, (_, i) => [i + 2, String(i + 2)] as [number, string]), model.get("minutes"));
+  fill($<HTMLSelectElement>(".resv"), [[9, "9 (~175 m)"], [10, "10 (~66 m)"], [11, "11 (~25 m)"], [12, "12 (~9 m)"]], model.get("resolution"));
+  $<HTMLSelectElement>(".mode").value = model.get("costing") as string;
+  const cats = () => {
+    const c: string[] = JSON.parse((model.get("categories") as string) || "[]");
+    fill($<HTMLSelectElement>(".cat"), c.map((n) => [n, n.toLowerCase()] as [string, string]), model.get("category"));
+  };
+  cats();
+  const meas = document.createElement("span");
+  meas.style.cssText = "position:absolute;visibility:hidden;white-space:pre;font:inherit;font-weight:600";
+  root.appendChild(meas);
+  const size = (sel: HTMLSelectElement) => {
+    if (CSS.supports && CSS.supports("field-sizing", "content")) return;
+    meas.textContent = sel.options[sel.selectedIndex]?.text || "";
+    sel.style.width = meas.getBoundingClientRect().width + 2 + "px";
+  };
+  root.querySelectorAll<HTMLSelectElement>("select").forEach((sel) => { size(sel); sel.addEventListener("change", () => size(sel)); });
+  const bind = (c: string, key: string, num: boolean) =>
+    $<HTMLSelectElement>(c).addEventListener("change", (e) => {
+      const v = (e.target as HTMLSelectElement).value;
+      model.set(key, num ? parseInt(v, 10) : v);
+      model.save_changes();
+      $(".busy").textContent = "working";
+    });
+  bind(".min", "minutes", true); bind(".mode", "costing", false); bind(".cat", "category", false); bind(".resv", "resolution", true);
+  // elevation scale: the slider and the number field move together; the layer redraws, the kernel is not asked
+  let elevScale = 30;
+  const hs = $<HTMLInputElement>(".hs"), hn = $<HTMLInputElement>(".hn");
+  const setScale = (v: number, from: HTMLInputElement) => {
+    if (!Number.isFinite(v) || v < 0) return;
+    elevScale = v;
+    if (from !== hs) hs.value = String(Math.min(v, 200));
+    if (from !== hn) hn.value = String(v);
+    draw();
+  };
+  hs.addEventListener("input", () => setScale(parseFloat(hs.value), hs));
+  hn.addEventListener("input", () => setScale(parseFloat(hn.value), hn));
+  const showCfg = () => {
+    const c = cfg();
+    if (c.area) $(".area").textContent = c.area;
+    if (!c.ramp) return;
+    $(".ramp").style.background = `linear-gradient(90deg, ${c.ramp.join(",")})`;
+    $(".hi").textContent = `${c.vmax} within reach`;
+    $(".n").textContent = `${(c.buildings || 0).toLocaleString()} buildings, ${(c.places || 0).toLocaleString()} ${c.plural}`;
+    $(".busy").textContent = c.busy ? "working" : "";
+  };
+
+  // ---- the map
+  maplibregl.setWorkerUrl(URL.createObjectURL(new Blob([maplibreWorker], { type: "text/javascript" })));
+  const c0 = cfg().view || { lon: -73.935, lat: 40.7, zoom: 12.3, pitch: 55, bearing: 0 };
+  let styleI = 0;
+  const map = new maplibregl.Map({ container: $(".map"), style: STYLES[0][1], center: [c0.lon, c0.lat], zoom: c0.zoom, pitch: c0.pitch, bearing: c0.bearing,
+    attributionControl: false, maxPitch: 75 });
+  map.keyboard.disable();
+  const overlay = new MapLibreOverlay({ interleaved: true, layers: [] });
+  map.addControl(overlay as unknown as maplibregl.IControl);
+  new ResizeObserver(() => map.resize()).observe($(".map"));
+
+  let table: arrow.Table | null = null;
+  let batch: arrow.RecordBatch | null = null;
+  let gen = 0; // a new layer id per data load: the GeoArrow layer trips on new accessors under an old id
+  let dataType = "none";
+  const col = <T>(name: string, i: number): T => table!.getChild(name)!.get(i) as T;
+
+  // ---- the tooltip: hover follows the cursor, a click pins it (click again, or Esc, releases)
+  const tip = $(".tip");
+  let pinned: number | null = null;
+  let last: { index: number; x: number; y: number } | null = null;
+  const esc = (s: string) => s.replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch] as string);
+  const place = (x: number, y: number) => {
+    const W = root.clientWidth, H = root.clientHeight, w = tip.offsetWidth || 280, h = tip.offsetHeight || 80;
+    let left = x + 16, top = y + 16;
+    if (left + w > W - 8) left = x - w - 16;
+    if (top + h > H - 8) top = Math.max(8, y - h - 16);
+    tip.style.left = `${Math.max(8, left)}px`; tip.style.top = `${top}px`;
+  };
+  const showTip = (index: number, x: number, y: number) => {
+    if (!table) return;
+    const c = cfg();
+    const n = col<number>("density", index);
+    const names = (col<string>("names", index) || "").split(", ").filter(Boolean);
+    const shown = names.slice(0, NAMES_SHOWN), more = names.length - shown.length;
+    const unit = n === 1 ? (c.plural || "places").replace(/ies$/, "y").replace(/s$/, "") : c.plural || "places";
+    tip.innerHTML =
+      `<div class="n">${n}<small>${esc(unit)} within a ${c.minutes ?? 5} minute ${(model.get("costing") as string) === "bicycle" ? "bike ride" : "walk"}</small></div>` +
+      `<ul class="names">${shown.map((s) => `<li>${esc(s)}</li>`).join("")}${more > 0 ? `<li class="more">and ${more} more</li>` : ""}</ul>` +
+      (pinned === null ? `<div class="hint">click to keep</div>` : `<div class="hint">click again or Esc to release</div>`);
+    tip.classList.add("on");
+    tip.classList.toggle("pinned", pinned !== null);
+    place(x, y);
+  };
+  const hideTip = () => { tip.classList.remove("on", "pinned"); };
+
+  const layers = () => {
+    if (!table || !batch) return [];
+    return [
+      new GeoArrowPolygonLayer({
+        id: `buildings-${gen}`,
+        data: batch,
+        getPolygon: batch.getChild("geometry")!.data[0] as never,
+        getFillColor: batch.getChild("rgba")!.data[0] as never,
+        getElevation: batch.getChild("elev")!.data[0] as never,
+        elevationScale: elevScale,
+        extruded: true,
+        filled: true,
+        stroked: false,
+        opacity: 0.95,
+        pickable: true,
+        autoHighlight: true,
+        highlightColor: [255, 255, 255, 110],
+        earcutWorkerUrl: null,
+        _validate: false,
+      } as never),
+    ];
+  };
+  type Pick = { index: number; x: number; y: number; layer?: { id: string } | null };
+  const onHover = (info: Pick) => {
+    if (pinned !== null) return;
+    if (info.index >= 0 && info.layer) { last = { index: info.index, x: info.x, y: info.y }; showTip(info.index, info.x, info.y); }
+    else { last = null; hideTip(); }
+  };
+  const clicks: unknown[] = [];
+  const onClick = (info: Pick) => {
+    clicks.push({ index: info.index, layer: info.layer?.id ?? null, x: info.x, y: info.y });
+    if (info.index < 0 || !info.layer) { if (pinned !== null) { pinned = null; hideTip(); } return; }
+    if (pinned === info.index) { pinned = null; showTip(info.index, info.x, info.y); return; }
+    pinned = info.index; showTip(info.index, info.x, info.y);
+  };
+  let lastClick = 0;
+  const onClickOnce = (info: Pick) => { const now = performance.now(); if (now - lastClick < 200) return; lastClick = now; onClick(info); };
+  const draw = () => overlay.setProps({ layers: layers(), onHover: onHover as never, onClick: onClickOnce as never });
+  type DeckLike = { _onPointerDown: (e: unknown) => void; _onEvent: (e: unknown) => void };
+  const deck = () => (overlay as unknown as { _deck?: DeckLike })._deck;
+  map.on("mousedown", (e: maplibregl.MapMouseEvent) => deck()?._onPointerDown({ type: "pointerdown", offsetCenter: e.point, srcEvent: e.originalEvent }));
+  map.on("click", (e: maplibregl.MapMouseEvent) => deck()?._onEvent({ type: "click", offsetCenter: e.point, tapCount: 1, srcEvent: e.originalEvent }));
+  const toBytes = (raw: unknown): Uint8Array | null => {
+    if (!raw) return null;
+    if (raw instanceof DataView) return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    if (raw instanceof Uint8Array) return raw;
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+    if (typeof raw === "string") { const b = atob(raw); const u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+    return null;
+  };
+  const loadData = () => {
+    const raw = model.get("data");
+    dataType = raw === null || raw === undefined ? "null" : (raw as object).constructor?.name || typeof raw;
+    const bytes = toBytes(raw);
+    if (!bytes || bytes.byteLength === 0) { table = null; batch = null; draw(); return; }
+    try {
+      table = arrow.tableFromIPC(bytes);
+      batch = table.batches[0] ?? null;
+      gen++;
+    } catch (e) {
+      console.error("five-min: could not read the buildings", e); table = null; batch = null;
+    }
+    pinned = null; hideTip();
+    draw();
+  };
+  // the buildings may have been sent before this page existed: if none arrived, ask the kernel once
+  setTimeout(() => { if (!table) { model.set("ask", String(Date.now())); model.save_changes(); } }, 2500);
+  map.on("load", () => { loadData(); showCfg(); });
+  model.on("change:data", loadData);
+  model.on("change:config", showCfg);
+  model.on("change:categories", cats);
+
+  // ---- the page: X fills the window / back to the notebook, Esc back, F the browser's full screen
+  const st = { fit: true };
+  const sizes = () => {
+    root.classList.toggle("fit", st.fit);
+    document.documentElement.classList.toggle(FIT, st.fit);
+    $(".xk").textContent = st.fit ? "notebook" : "fill window";
+    setTimeout(() => map.resize(), 30);
+  };
+  const fsOn = () => !!(document.fullscreenElement || (document as unknown as { webkitFullscreenElement?: Element }).webkitFullscreenElement);
+  const fullScreen = () => {
+    if (fsOn()) { document.exitFullscreen(); return; }
+    const r = root.requestFullscreen?.(); if (r && r.catch) r.catch(() => {});
+  };
+  const onKey = (e: KeyboardEvent) => {
+    const t = e.composedPath()[0] as HTMLElement | undefined, tag = t && t.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable)) return;
+    if (e.key === "x" || e.key === "X") { st.fit = !st.fit; sizes(); }
+    else if (e.key === "f" || e.key === "F") fullScreen();
+    else if (e.key === "m" || e.key === "M") nextStyle();
+    else if (e.shiftKey && e.key.startsWith("Arrow")) {
+      e.preventDefault();
+      if (e.key === "ArrowLeft") map.easeTo({ bearing: map.getBearing() - 10, duration: 250 });
+      else if (e.key === "ArrowRight") map.easeTo({ bearing: map.getBearing() + 10, duration: 250 });
+      else if (e.key === "ArrowUp") map.easeTo({ pitch: Math.min(80, map.getPitch() + 10), duration: 250 });
+      else if (e.key === "ArrowDown") map.easeTo({ pitch: Math.max(0, map.getPitch() - 10), duration: 250 });
+    }
+    else if (e.key.startsWith("Arrow")) {
+      e.preventDefault();
+      const d = 80, dx = e.key === "ArrowLeft" ? -d : e.key === "ArrowRight" ? d : 0, dy = e.key === "ArrowUp" ? -d : e.key === "ArrowDown" ? d : 0;
+      map.panBy([dx, dy], { duration: 200 });
+    }
+    else if (e.key === "Escape") { if (pinned !== null) { pinned = null; hideTip(); } else if (st.fit && !fsOn()) { st.fit = false; sizes(); } }
+  };
+  const nextStyle = () => {
+    styleI = (styleI + 1) % STYLES.length;
+    map.setStyle(STYLES[styleI][1]);
+    $(".mk").textContent = STYLES[(styleI + 1) % STYLES.length][0];
+    root.classList.toggle("light", styleI !== 0);
+  };
+  const onFs = () => setTimeout(() => map.resize(), 60);
+  $(".km").onclick = nextStyle;
+  $(".kx").onclick = () => { st.fit = !st.fit; sizes(); };
+  $(".kf").onclick = fullScreen;
+  window.addEventListener("keydown", onKey);
+  document.addEventListener("fullscreenchange", onFs);
+  (window as unknown as { _fm: unknown })._fm = { st, sizes, map, tableRows: () => table?.numRows ?? 0, pinned: () => pinned, scale: () => elevScale, style: () => STYLES[styleI][0], dataType: () => dataType, batch: () => batch, overlay, clicks };
+  sizes();
+  showCfg();
+
+  return () => {
+    window.removeEventListener("keydown", onKey);
+    document.removeEventListener("fullscreenchange", onFs);
+    document.documentElement.classList.remove(FIT);
+    try { map.remove(); } catch { /* gone */ }
+  };
+}
+
+export default { render };
