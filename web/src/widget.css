@@ -55,7 +55,7 @@
 .fm .foot .nb input { margin: 0; accent-color: #d9f3a7; }
 
 /* the panel on the right while a building is locked: the headline, the routes line, the table of the places */
-.fm .side { position: absolute; top: 14px; right: 14px; bottom: 30px; z-index: 6; width: min(560px, calc(100vw - 320px)); display: none; flex-direction: column; padding: 12px 14px 12px; }
+.fm .side { position: absolute; top: 14px; right: 14px; bottom: 30px; z-index: 6; width: min(330px, calc(100vw - 320px)); display: none; flex-direction: column; padding: 12px 14px 12px; }
 .fm .side.on { display: flex; }
 .fm .side .head .n { font-size: 24px; font-weight: 600; line-height: 1.1; letter-spacing: -0.01em; }
 .fm .side .head .n small { font-size: 12.5px; font-weight: 400; color: #8d9aa3; margin-left: 6px; letter-spacing: 0; }

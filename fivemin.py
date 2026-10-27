@@ -3,8 +3,9 @@ walk-shed counts on H3 cells, and the cells clipped to the neighborhoods (North 
 Williamsburg NTAs, Fort Greene, Clinton Hill, both Bedford-Stuyvesant NTAs and both Bushwick NTAs).
 
 Everything read from the network is cached under data/cache/ so the notebook restarts fast. What the router produces
-(isochrones, the H3 cells built from them, routes) is kept in tables of the kernel's in-memory DuckDB database, so
-flipping a knob back to an earlier setting answers from the table instead of running Valhalla again.
+(isochrones, the H3 cells built from them, routes) is kept in tables of a DuckDB database file (data/cache/fivemin.duckdb),
+so flipping a knob back to an earlier setting, or restarting, answers from the table instead of running Valhalla again.
+When another process already holds that file open for writing, this one works in memory instead.
 """
 
 from __future__ import annotations
@@ -71,7 +72,12 @@ def connection() -> duckdb.DuckDBPyConnection:
     """One DuckDB connection per process with httpfs, spatial and h3 loaded; a cursor per call so threads are safe."""
     with _lock:
         if "con" not in _con:
-            con = duckdb.connect()
+            CACHE.mkdir(parents=True, exist_ok=True)
+            try:
+                con = duckdb.connect(str(CACHE / "fivemin.duckdb"))
+            except duckdb.Error as e:  # another process has the file: keep this one's results in memory
+                print(f"fivemin.duckdb is in use ({str(e).splitlines()[0]}); caching in memory for this process")
+                con = duckdb.connect()
             con.execute(
                 "INSTALL httpfs; LOAD httpfs; INSTALL spatial; LOAD spatial; INSTALL h3 FROM community; LOAD h3; "
                 "SET s3_region='us-west-2'; SET enable_object_cache=true;"
@@ -406,7 +412,7 @@ import functools
 @functools.lru_cache(maxsize=6)
 def _run(category, costing, minutes, resolution, log=print):
     pts = places(category, log=log)
-    key = f"{category}|{costing}|{minutes:g}"
+    key = f"{AREA_KEY}|{category}|{costing}|{minutes:g}"  # the area is part of the key: a changed NTA list recomputes
     iso = isochrones_cached(key, pts, costing, minutes, log)
     cells = h3_density_cached(f"{key}|{resolution}", iso, resolution, boundary(log), log)
     bld = buildings_scored(cells, iso["name"], log=log)
@@ -468,8 +474,8 @@ def pack(bld: gpd.GeoDataFrame, rgba: np.ndarray, names: bool = True) -> bytes:
 
 
 def places_json(iso: pd.DataFrame) -> str:
-    """The places as the page needs them for lighting points: [[lon, lat, name], ...] in `poi_ids` order."""
-    return json.dumps([[round(float(x), 6), round(float(y), 6), str(n)] for x, y, n in zip(iso["lon"], iso["lat"], iso["name"].fillna(""))])
+    """The places as the page needs them for lighting points: [[lon, lat, name, id], ...] in `poi_ids` order."""
+    return json.dumps([[round(float(x), 6), round(float(y), 6), str(n), str(i)] for x, y, n, i in zip(iso["lon"], iso["lat"], iso["name"].fillna(""), iso["id"])])
 
 
 def selection_parquet(iso: pd.DataFrame, routes: list[dict], nta_name: str = "") -> bytes:

@@ -35,7 +35,7 @@ type Cfg = { ramp?: string[]; vmax?: number; buildings?: number; places?: number
 type Nta = { name: string; vmax: number | null; label: [number, number]; rings: [number, number][][] };
 // flat mode: a footprint hovered or locked dims the others, lights the places that reach it, and once locked draws the
 // routes from it to them. All page side, except the routes, which the kernel answers over the custom message channel.
-type Place = [number, number, string];
+type Place = [number, number, string, string]; // lon, lat, name, id
 type Route = { i: number; path: [number, number][]; minutes: number; meters: number; name: string };
 const LIT: [number, number, number] = [217, 243, 167]; // the ramp's light end, the card's accent
 const GOLD: [number, number, number] = [240, 192, 64]; // the places: a gold ring, open in the middle
@@ -78,7 +78,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
       <div class="foot"><span class="n"></span><label class="res">cells <select class="resv"></select></label>
         <label class="nb"><input class="nbv" type="checkbox"> each neighborhood on its own scale</label>
         <label class="hgt">height <input class="hs" type="range" min="0" max="200" step="0.5" value="30"> <input class="hn" type="number" min="0" max="10000" step="0.5" value="30"> ×</label></div>
-      <div class="keys"><span class="kx"><kbd>X</kbd> <b class="xk">notebook</b></span><span class="kf"><kbd>F</kbd> full screen</span>
+      <div class="keys"><span class="kn"><kbd>N</kbd> neighborhoods</span><span class="kf"><kbd>F</kbd> full screen</span>
         <span class="km"><kbd>M</kbd> <b class="mk">voyager</b></span><span class="ke"><kbd>E</kbd> <b class="ek">extrude</b></span><span class="kk" title="Shift with the arrow keys turns and tilts the map"><kbd>Shift</kbd> arrows turn, tilt</span><span class="busy"></span></div>
     </div>
     <div class="tip glass"></div>
@@ -121,6 +121,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   const nbv = $<HTMLInputElement>(".nbv");
   nbv.checked = !!model.get("nbhd");
   nbv.addEventListener("change", () => { model.set("nbhd", nbv.checked); model.save_changes(); $(".busy").textContent = "working"; });
+  const toggleNbhd = () => { nbv.checked = !nbv.checked; nbv.dispatchEvent(new Event("change")); };
   // elevation scale: the slider and the number field move together; the layer redraws, the kernel is not asked
   let elevScale = 30;
   const hs = $<HTMLInputElement>(".hs"), hn = $<HTMLInputElement>(".hn");
@@ -181,9 +182,13 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   };
   let hot: number | null = null; // the part hovered or locked, in flat mode
   let extruded = !cfg().flat; // E toggles; the flat page starts flat
+  const STROKE_ZOOM = 15.5;
+  let strokeOn = false;
+  map.on("zoom", () => { const on = map.getZoom() >= STROKE_ZOOM; if (on !== strokeOn) { strokeOn = on; draw(); } });
   let routes: Route[] = [];
   let routesFor: number | null = null; // the fid the routes answer
   let hotPlace: number | null = null; // while locked: the place ring under the cursor (position in the building's ids)
+  let stuckPlace: number | null = null; // a table row clicked: stays lit after the mouse leaves the table
 
   // ---- the tooltip: hover follows the cursor, a click pins it (click again, or Esc, releases)
   const tip = $(".tip");
@@ -231,14 +236,29 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   const hideTip = () => { tip.classList.remove("on", "pinned"); };
   const side = $(".side");
   let htRoot: Root | null = null;
+  let tableRowsData: Record<string, unknown>[] = [];
   const showTable = async (b64: string) => {
     const bin = atob(b64), buf = new ArrayBuffer(bin.length), u = new Uint8Array(buf);
     for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
     const rows = await parquetReadObjects({ file: { byteLength: buf.byteLength, slice: (a: number, b?: number) => buf.slice(a, b) } });
+    tableRowsData = rows as Record<string, unknown>[];
     if (!htRoot) htRoot = createRoot($(".side .ht"));
     htRoot.render(createElement(HighTable, { data: sortableDataFrame(arrayDataFrame(rows)), cacheKey: "fm-places", focus: false, onError: console.error } as never));
   };
-  const hideSide = () => { side.classList.remove("on"); if (htRoot) { htRoot.unmount(); htRoot = null; } };
+  const hideSide = () => { side.classList.remove("on"); stuckPlace = null; tableRowsData = []; if (htRoot) { htRoot.unmount(); htRoot = null; } };
+  // a table row -> the place's position in the locked building's ids (the row header keeps the parquet row number under any sort)
+  const rowPlace = (el: Element | null): number | null => {
+    const tr = el?.closest("tr"), th = tr?.querySelector("[role=rowheader]");
+    const n = th ? parseInt(th.textContent || "", 10) : NaN;
+    const id = Number.isFinite(n) ? tableRowsData[n - 1]?.id : undefined;
+    if (id === undefined || pinned === null) return null;
+    const k = idsOf(pinned).findIndex((pi) => places[pi]?.[3] === String(id));
+    return k >= 0 ? k : null;
+  };
+  const setHotPlace = (k: number | null) => { if (k === hotPlace) return; hotPlace = k; draw(); };
+  $(".side .ht").addEventListener("mouseover", (e) => { const k = rowPlace(e.target as Element); if (k !== null) setHotPlace(k); });
+  $(".side .ht").addEventListener("mouseleave", () => setHotPlace(stuckPlace));
+  $(".side .ht").addEventListener("click", (e) => { const k = rowPlace(e.target as Element); if (k !== null) { stuckPlace = stuckPlace === k ? null : k; setHotPlace(stuckPlace ?? k); } });
   // the small tooltip on a place ring while a building is locked: the name, the route's minutes and distance
   const ptip = $(".ptip");
   const showPlace = (k: number, x: number, y: number) => {
@@ -269,9 +289,8 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
         elevationScale: up ? elevScale : 0,
         extruded: up,
         filled: true,
-        // a hairline in meters, never widened to a minimum: nothing at the area view (a few hundredths of a pixel),
-        // a faint edge from about zoom 16 when a building is being picked, capped at one pixel
-        stroked: true,
+        // a hairline only once zoomed in to pick a building (STROKE_ZOOM); none at all at the area view
+        stroked: strokeOn,
         getLineColor: [176, 200, 190, 110],
         getLineWidth: 1.5,
         lineWidthUnits: "meters",
@@ -279,7 +298,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
         lineWidthMaxPixels: 1,
         // with a building hovered or locked the rest all but vanish, so its places and routes read
         opacity: lit ? 0.06 : 0.95,
-        pickable: true,
+        pickable: !up, // extruded is for the effect only: no hover, no tooltip, no lock
         autoHighlight: !flat,
         highlightColor: [255, 255, 255, 110],
         earcutWorkerUrl: null,
@@ -360,7 +379,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
         getPosition: (d: Place) => [d[0], d[1]],
         // filled at alpha 1 so the ring's inside picks too, while locked
         filled: true,
-        getFillColor: (_d: Place, o: { index: number }) => (o.index === hotPlace ? [...GOLD, 70] : [0, 0, 0, 1]),
+        getFillColor: (_d: Place, o: { index: number }) => (o.index === hotPlace ? [255, 255, 255, 255] : [0, 0, 0, 1]), // the lit place fills white
         stroked: true,
         getLineColor: [...GOLD, 255],
         getLineWidth: (_d: Place, o: { index: number }) => (o.index === hotPlace ? 3 : 2),
@@ -381,7 +400,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   const onHover = (info: Pick) => {
     if (pinned !== null) {
       const k = info.index >= 0 && info.layer?.id === "hot-places" ? info.index : null;
-      if (k !== hotPlace) { hotPlace = k; draw(); }
+      setHotPlace(k ?? stuckPlace);
       if (k !== null) showPlace(k, info.x, info.y); else hidePlace();
       return;
     }
@@ -394,7 +413,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
     routes = []; routesFor = null;
     try { model.send({ pin: fid }); } catch (e) { console.error("five-min: could not ask for routes", e); }
   };
-  const release = () => { pinned = null; routes = []; routesFor = null; hotPlace = null; hidePlace(); hideTip(); hideSide(); setHot(null); try { model.send({ pin: -1 }); } catch { /* no channel */ } };
+  const release = () => { pinned = null; routes = []; routesFor = null; hotPlace = null; stuckPlace = null; hidePlace(); hideTip(); hideSide(); setHot(null); try { model.send({ pin: -1 }); } catch { /* no channel */ } };
   model.on("msg:custom", (msg: unknown) => {
     const m = msg as { pin?: number; routes?: Route[]; table?: string } | null;
     if (!m || typeof m.pin !== "number" || !table) return;
@@ -463,7 +482,6 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   const sizes = () => {
     root.classList.toggle("fit", st.fit);
     document.documentElement.classList.toggle(FIT, st.fit);
-    $(".xk").textContent = st.fit ? "notebook" : "fill window";
     setTimeout(() => map.resize(), 30);
   };
   const fsOn = () => !!(document.fullscreenElement || (document as unknown as { webkitFullscreenElement?: Element }).webkitFullscreenElement);
@@ -474,7 +492,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   const onKey = (e: KeyboardEvent) => {
     const t = e.composedPath()[0] as HTMLElement | undefined, tag = t && t.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable)) return;
-    if (e.key === "x" || e.key === "X") { st.fit = !st.fit; sizes(); }
+    if (e.key === "n" || e.key === "N") toggleNbhd();
     else if (e.key === "f" || e.key === "F") fullScreen();
     else if (e.key === "m" || e.key === "M") nextStyle();
     else if (e.key === "e" || e.key === "E") toggleExtrude();
@@ -490,7 +508,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
       const d = 80, dx = e.key === "ArrowLeft" ? -d : e.key === "ArrowRight" ? d : 0, dy = e.key === "ArrowUp" ? -d : e.key === "ArrowDown" ? d : 0;
       map.panBy([dx, dy], { duration: 200 });
     }
-    else if (e.key === "Escape") { if (pinned !== null) release(); else if (st.fit && !fsOn()) { st.fit = false; sizes(); } }
+    else if (e.key === "Escape") { if (pinned !== null) release(); }
   };
   const nextStyle = () => {
     styleI = (styleI + 1) % STYLES.length;
@@ -500,7 +518,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   };
   const toggleExtrude = () => {
     extruded = !extruded;
-    if (extruded && pinned !== null) release();
+    if (extruded) { if (pinned !== null) release(); hideTip(); setHot(null); }
     $(".ek").textContent = extruded ? "flatten" : "extrude";
     root.classList.toggle("flat", !!cfg().flat && !extruded);
     if (extruded && map.getPitch() < 20) map.easeTo({ pitch: 50, duration: 500 });
@@ -511,7 +529,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   $(".ek").textContent = extruded ? "flatten" : "extrude";
   const onFs = () => setTimeout(() => map.resize(), 60);
   $(".km").onclick = nextStyle;
-  $(".kx").onclick = () => { st.fit = !st.fit; sizes(); };
+  $(".kn").onclick = toggleNbhd;
   $(".kf").onclick = fullScreen;
   window.addEventListener("keydown", onKey);
   document.addEventListener("fullscreenchange", onFs);
