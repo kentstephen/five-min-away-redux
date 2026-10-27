@@ -29,10 +29,11 @@ def _(anywidget, fivemin, json, mo, pathlib, traitlets):
 
         _esm = pathlib.Path(__file__).parent / "web" / "dist" / "widget.js"
         # page -> kernel
-        category = traitlets.Unicode("Coffee Shop").tag(sync=True)
+        category = traitlets.Unicode("Bar").tag(sync=True)
         costing = traitlets.Unicode("pedestrian").tag(sync=True)
         minutes = traitlets.Int(10).tag(sync=True)
         resolution = traitlets.Int(11).tag(sync=True)
+        nbhd = traitlets.Bool(False).tag(sync=True)  # score each neighborhood on its own scale, draw its boundary
         ask = traitlets.Unicode("").tag(sync=True)  # the page asks for the buildings again (it rendered after they were sent)
         # kernel -> page
         categories = traitlets.Unicode("[]").tag(sync=True)
@@ -59,7 +60,7 @@ def _(anywidget, fivemin, json, mo, pathlib, traitlets):
         row = bld.iloc[fid]
         c = row.geometry.representative_point()
         try:
-            rts = fivemin.routes((c.x, c.y), iso.iloc[list(row["poi_ids"])], costing, log=lambda *_: None)
+            rts = fivemin.routes((c.x, c.y), iso.iloc[list(row["poi_ids"])], costing, bid=str(row["id"]), log=lambda *_: None)
         except Exception:  # the router threw: answer with no routes so the page stops waiting
             rts = []
         widget.send({"pin": fid, "routes": rts})
@@ -72,9 +73,9 @@ def _(anywidget, fivemin, json, mo, pathlib, traitlets):
 def _(fivemin, page):
     # ---- places -> isochrones -> H3 cells clipped to the NTAs -> buildings scored by how many places reach them
     _v = page.value
-    category, costing, minutes, resolution = _v["category"], _v["costing"], int(_v["minutes"]), int(_v["resolution"])
+    category, costing, minutes, resolution, nbhd = _v["category"], _v["costing"], int(_v["minutes"]), int(_v["resolution"]), bool(_v.get("nbhd", False))
     pts, iso, cells, bld = fivemin.run(category, costing, minutes, resolution, log=lambda *_: None)
-    return bld, category, cells, costing, iso, minutes, pts, resolution
+    return bld, category, cells, costing, iso, minutes, nbhd, pts, resolution
 
 
 @app.cell
@@ -82,7 +83,8 @@ def _(np):
     # CARTO Emrld remade as 50 stops (from the usgs-mrms-flood ramp): the same hue path, extended to pale sage at the
     # light end and near-black navy at the dark end. Drawn dark to light: few places within reach is dark, many is light.
     EMRLD_LIGHT_TO_DARK = ['#e9f3bf', '#d9f3a7', '#c9f0a0', '#b9ed9d', '#abea9a', '#9fe598', '#96e096', '#8fdb93', '#88d591', '#81cf8f', '#79ca8e', '#72c48c', '#6abf8b', '#64b989', '#5fb388', '#5aad86', '#56a785', '#51a183', '#4c9b82', '#469581', '#3e9080', '#378a7f', '#2f857d', '#287f7b', '#217a79', '#1b7476', '#176f73', '#156970', '#13636c', '#115d68', '#105864', '#0e5360', '#0c4d5c', '#0a4857', '#084353', '#063e4e', '#053949', '#043443', '#042f3d', '#032b38', '#032632', '#02222e', '#021d29', '#021925', '#011421', '#01101d', '#010b19', '#010715', '#010411', '#01020e']
-    EMRLD = EMRLD_LIGHT_TO_DARK[::-1]
+    # the floor lifted a little: the darkest stops are near-black and vanish on the dark basemap
+    EMRLD = EMRLD_LIGHT_TO_DARK[::-1][5:]
 
     def ramp(values, vmin, vmax, alpha=255):
         """RGBA rows for values on the ramp, vmin at the dark end, vmax at the light end."""
@@ -97,7 +99,7 @@ def _(np):
 
 
 @app.cell
-def _(EMRLD, HOME, STATE, bld, category, costing, fivemin, iso, json, minutes, page, pts, ramp):
+def _(EMRLD, HOME, STATE, bld, category, costing, fivemin, iso, json, minutes, nbhd, np, page, pts, ramp):
     # ---- push the buildings (GeoArrow) and the card's numbers to the page
     def _plural(name):
         w = name.lower()
@@ -105,11 +107,22 @@ def _(EMRLD, HOME, STATE, bld, category, costing, fivemin, iso, json, minutes, p
 
     VMAX = max(int(bld["poi_density"].max()) if len(bld) else 1, 5)
     STATE.update(bld=bld, iso=iso, costing=costing)
+    _ntas = fivemin.ntas(log=lambda *_: None)
+    if nbhd:
+        # each neighborhood on its own scale: its brightest building is the one with the most within reach there
+        _vm = bld.groupby("nta")["poi_density"].max()
+        _per = np.array([max(int(_vm.get(i, 1)), 1) for i in range(len(_ntas))])
+        _scale = np.where(bld["nta"].to_numpy() >= 0, _per[np.maximum(bld["nta"].to_numpy(), 0)], VMAX)
+        _rgba = ramp(bld["poi_density"].to_numpy() / _scale, 0, 1)
+    else:
+        _rgba = ramp(bld["poi_density"], 0, VMAX)
     page.widget.places = fivemin.places_json(iso)
-    page.widget.data = fivemin.pack(bld, ramp(bld["poi_density"], 0, VMAX), names=False)
+    page.widget.data = fivemin.pack(bld, _rgba, names=False)
     page.widget.config = json.dumps(
         {"ramp": EMRLD, "vmax": VMAX, "buildings": int(len(bld)), "places": int(len(pts)), "plural": _plural(category),
-         "minutes": minutes, "area": fivemin.PLACE_NAME, "view": HOME, "busy": False, "flat": True}
+         "minutes": minutes, "area": fivemin.PLACE_NAME, "view": HOME, "busy": False, "flat": True, "nbhd": nbhd,
+         "ntas": [{"name": n, "vmax": int(_vm.get(i, 0)) if nbhd else None, "label": [c.x, c.y], "rings": [list(map(list, g.exterior.coords)) for g in (geom.geoms if hasattr(geom, "geoms") else [geom])]}
+                  for i, (n, geom, c) in enumerate(zip(_ntas["name"], _ntas.geometry, _ntas.geometry.representative_point()))]}
     )
     page
     return (VMAX,)

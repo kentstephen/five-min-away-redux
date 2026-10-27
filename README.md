@@ -17,6 +17,10 @@ cd web && npm install && npm run build && cd ..
 Keys on the map: X notebook or fill the window, F full screen, M basemap, Shift+arrows turn and tilt. Hover a building
 to see which places reach it, click to keep it.
 
-`five_min_near.py` draws the same footprints flat. Hovering a building fades the others and lights the places whose
-walk shed reaches it as points; clicking locks it and draws the route from the building to each of those places (the
-walk or bike route from the local Valhalla graph), until the building is clicked again or Esc. Ten minutes is the default.
+`five_min_near.py` draws the same footprints flat. Hovering a building fades the others and marks the places whose
+walk shed reaches it with gold rings; clicking locks it and draws the route from the building to each of those places
+(the walk or bike route from the local Valhalla graph) on the Emrld ramp by travel time, shortest brightest. Hovering a
+ring names the place and its route; any click or Esc releases. Ten minutes from a bar is the default. A checkbox scores
+each neighborhood on its own scale and draws the boundaries; E extrudes the buildings to see the scale. The router's
+output (isochrones, H3 cells, routes) is kept in tables of the kernel's in-memory DuckDB, so flipping a knob back
+answers from the table instead of running Valhalla again.

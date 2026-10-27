@@ -47,3 +47,9 @@
 /* flat mode: footprints only, no height; the tooltip notes the routes once they are drawn */
 .fm.flat .hgt { display: none; }
 .fm .tip .routes { margin-top: 8px; font-size: 11.5px; color: #d9f3a7; }
+.fm .ptip { position: absolute; z-index: 7; padding: 6px 10px 7px; pointer-events: none; display: none; font-size: 12px; line-height: 1.35; white-space: nowrap; }
+.fm .ptip.on { display: block; }
+.fm .ptip b { font-weight: 600; display: block; }
+.fm .ptip span { color: #f0c040; }
+.fm .foot .nb { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.fm .foot .nb input { margin: 0; accent-color: #d9f3a7; }

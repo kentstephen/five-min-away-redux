@@ -2,7 +2,9 @@
 walk-shed counts on H3 cells, and the cells clipped to the neighborhoods (North Brooklyn: Greenpoint, the three
 Williamsburg NTAs, Fort Greene, Clinton Hill, both Bedford-Stuyvesant NTAs and both Bushwick NTAs).
 
-Everything read from the network is cached under data/cache/ so the notebook restarts fast.
+Everything read from the network is cached under data/cache/ so the notebook restarts fast. What the router produces
+(isochrones, the H3 cells built from them, routes) is kept in tables of the kernel's in-memory DuckDB database, so
+flipping a knob back to an earlier setting answers from the table instead of running Valhalla again.
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ NTAS = {
     "BK0401": "Bushwick (West)",
     "BK0402": "Bushwick (East)",
 }
+# Neighborhoods as drawn and scored: one per NTA, except where several NTAs are one neighborhood
+GROUPS = {"Bushwick": ["BK0401", "BK0402"]}
 PLACE_NAME = "North Brooklyn"
 # cache file suffix: the NTA codes, so a changed neighborhood list reads a fresh box instead of reusing an old one
 AREA_KEY = "nb" + str(len(NTAS))
@@ -71,6 +75,12 @@ def connection() -> duckdb.DuckDBPyConnection:
             con.execute(
                 "INSTALL httpfs; LOAD httpfs; INSTALL spatial; LOAD spatial; INSTALL h3 FROM community; LOAD h3; "
                 "SET s3_region='us-west-2'; SET enable_object_cache=true;"
+            )
+            # the router's output, kept for the life of the kernel
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS iso_cache (key TEXT, pid INTEGER, id TEXT, name TEXT, category TEXT, confidence DOUBLE, lon DOUBLE, lat DOUBLE, wkb BLOB);"
+                "CREATE TABLE IF NOT EXISTS cells_cache (key TEXT, hex TEXT, poi_density INTEGER, poi_names TEXT, poi_ids INTEGER[], wkb BLOB);"
+                "CREATE TABLE IF NOT EXISTS routes_cache (bid TEXT, pid TEXT, costing TEXT, path JSON, minutes DOUBLE, meters DOUBLE);"
             )
             _con["con"] = con
     return _con["con"].cursor()
@@ -132,6 +142,24 @@ def boundary(log=print) -> shapely.Geometry:
         out.unlink()
         raise RuntimeError(f"NTA fetch returned {sorted(got)}, wanted {sorted(NTAS)}")
     return shapely.union_all([shapely.geometry.shape(f["geometry"]) for f in fc["features"]])
+
+
+def ntas(log=print) -> gpd.GeoDataFrame:
+    """The neighborhoods as rows: code, name, geometry, in NTAS order, with the NTAs of a GROUPS entry dissolved into
+    one row named for the group."""
+    boundary(log)  # fetches and checks the file
+    fc = json.loads((CACHE / f"ntas_{AREA_KEY}.geojson").read_text())
+    by = {f["properties"]["nta2020"]: shapely.geometry.shape(f["geometry"]) for f in fc["features"]}
+    grouped = {c: g for g, cs in GROUPS.items() for c in cs}
+    codes, names, geoms, done = [], [], [], set()
+    for k, n in NTAS.items():
+        g = grouped.get(k)
+        if g is None:
+            codes.append(k); names.append(n); geoms.append(by[k])
+        elif g not in done:
+            done.add(g)
+            codes.append("+".join(GROUPS[g])); names.append(g); geoms.append(shapely.union_all([by[c] for c in GROUPS[g]]))
+    return gpd.GeoDataFrame({"code": codes, "name": names}, geometry=geoms, crs="EPSG:4326")
 
 
 _area = {}
@@ -227,21 +255,70 @@ def _decode6(shape: str) -> list[list[float]]:
     return out
 
 
-def routes(origin: tuple[float, float], targets: pd.DataFrame, costing: str = "pedestrian", log=print) -> list[dict]:
-    """The route from one point (lon, lat) to each target row (lon, lat, name): {"path": [[lon, lat], ...],
-    "minutes", "meters", "name"} per target that the router can reach."""
+def routes(origin: tuple[float, float], targets: pd.DataFrame, costing: str = "pedestrian", bid: str | None = None, log=print) -> list[dict]:
+    """The route from one point (lon, lat) to each target row (id, lon, lat, name): {"i": the target's position, "path":
+    [[lon, lat], ...], "minutes", "meters", "name"} per target that the router can reach. With `bid` (the building's
+    id) the routes are kept in the routes_cache table and answered from it next time."""
     a = actor()
     t = time.time()
-    out = []
-    for lon, lat, name in zip(targets["lon"].to_numpy(), targets["lat"].to_numpy(), targets["name"].fillna("").to_numpy()):
+    con = connection() if bid else None
+    known = {}
+    if con is not None:
+        ids = ", ".join(f"'{i}'" for i in targets["id"].astype(str))
+        for pid, path, mins, m in con.execute(f"SELECT pid, path, minutes, meters FROM routes_cache WHERE bid = ? AND costing = ? AND pid IN ({ids})", [bid, costing]).fetchall():
+            known[pid] = (json.loads(path), mins, m)
+    out, new = [], []
+    for k, (pid, lon, lat, name) in enumerate(zip(targets["id"].astype(str).to_numpy(), targets["lon"].to_numpy(), targets["lat"].to_numpy(), targets["name"].fillna("").to_numpy())):
+        if pid in known:
+            path, mins, m = known[pid]
+            out.append({"i": k, "path": path, "minutes": mins, "meters": m, "name": str(name)})
+            continue
         try:
             r = a.route({"locations": [{"lon": origin[0], "lat": origin[1]}, {"lon": float(lon), "lat": float(lat)}], "costing": costing, "units": "kilometers"})
             trip = r["trip"]
             path = [p for leg in trip["legs"] for p in _decode6(leg["shape"])]
-            out.append({"path": path, "minutes": trip["summary"]["time"] / 60, "meters": trip["summary"]["length"] * 1000, "name": str(name)})
+            mins, m = trip["summary"]["time"] / 60, trip["summary"]["length"] * 1000
+            out.append({"i": k, "path": path, "minutes": mins, "meters": m, "name": str(name)})
+            new.append((bid, pid, costing, json.dumps(path), mins, m))
         except Exception as e:
             log(f"route to ({lon:.5f}, {lat:.5f}) failed: {e}")
-    log(f"{len(out)} of {len(targets)} {costing} routes in {time.time() - t:.1f} s")
+    if con is not None and new:
+        con.executemany("INSERT INTO routes_cache VALUES (?, ?, ?, ?, ?, ?)", new)
+    log(f"{len(out)} of {len(targets)} {costing} routes ({len(known)} from the table) in {time.time() - t:.1f} s")
+    return out
+
+
+def isochrones_cached(key: str, df: pd.DataFrame, costing: str, minutes: float, log=print) -> gpd.GeoDataFrame:
+    """isochrones(), answered from the iso_cache table when this key (category, mode, minutes) was computed before."""
+    con = connection()
+    hit = con.sql(f"SELECT id, name, category, confidence, lon, lat, wkb FROM iso_cache WHERE key = '{key}' ORDER BY pid").to_arrow_table()
+    if hit.num_rows:
+        d = hit.drop_columns(["wkb"]).to_pandas()
+        log(f"{len(d)} isochrones for {key} from the table")
+        return gpd.GeoDataFrame(d, geometry=shapely.from_wkb(hit.column("wkb").to_pylist()), crs="EPSG:4326")
+    out = isochrones(df, costing, minutes, log)
+    rows = pd.DataFrame({"key": key, "pid": np.arange(len(out), dtype=np.int32), "id": out["id"].astype(str), "name": out["name"], "category": out["category"],
+                         "confidence": out["confidence"].astype(float), "lon": out["lon"], "lat": out["lat"], "wkb": [bytes(b) for b in shapely.to_wkb(out.geometry.to_numpy())]})
+    con.register("iso_rows", rows)
+    con.execute("INSERT INTO iso_cache SELECT * FROM iso_rows")
+    con.unregister("iso_rows")
+    return out
+
+
+def h3_density_cached(key: str, iso: gpd.GeoDataFrame, resolution: int, clip, log=print) -> gpd.GeoDataFrame:
+    """h3_density(), answered from the cells_cache table when this key (category, mode, minutes, resolution) was computed before."""
+    con = connection()
+    hit = con.sql(f"SELECT hex, poi_density, poi_names, poi_ids, wkb FROM cells_cache WHERE key = '{key}'").to_arrow_table()
+    if hit.num_rows:
+        d = hit.drop_columns(["wkb"]).to_pandas()
+        log(f"{len(d)} cells for {key} from the table")
+        return gpd.GeoDataFrame(d, geometry=shapely.from_wkb(hit.column("wkb").to_pylist()), crs="EPSG:4326")
+    out = h3_density(iso, resolution, clip, log)
+    rows = pd.DataFrame({"key": key, "hex": out["hex"], "poi_density": out["poi_density"].astype(np.int32), "poi_names": out["poi_names"],
+                         "poi_ids": [list(map(int, v)) for v in out["poi_ids"]], "wkb": [bytes(b) for b in shapely.to_wkb(out.geometry.to_numpy())]})
+    con.register("cell_rows", rows)
+    con.execute("INSERT INTO cells_cache SELECT * FROM cell_rows")
+    con.unregister("cell_rows")
     return out
 
 
@@ -305,6 +382,14 @@ def buildings_scored(cells: gpd.GeoDataFrame, names: pd.Series | None = None, ar
     out = gpd.GeoDataFrame(t_.drop_columns(["geom"]).to_pandas(), geometry=geom, crs="EPSG:4326")
     nm = names.fillna("").to_numpy(object) if names is not None else None
     out["poi_names"] = [", ".join(sorted({str(nm[i]) for i in ids} - {""})) if nm is not None else "" for ids in out["poi_ids"]]
+    # the neighborhood each building sits in (by a point inside it), -1 outside all of them
+    n = ntas(log)
+    tree = shapely.STRtree(n.geometry.to_numpy())
+    pts_ = out.geometry.representative_point().to_numpy()
+    nta = np.full(len(out), -1, np.int8)
+    bi, ni = tree.query(pts_, predicate="within")
+    nta[bi] = ni
+    out["nta"] = nta
     log(f"{len(out)} buildings scored in {time.time() - t:.1f} s")
     return out
 
@@ -321,8 +406,9 @@ import functools
 @functools.lru_cache(maxsize=6)
 def _run(category, costing, minutes, resolution, log=print):
     pts = places(category, log=log)
-    iso = isochrones(pts, costing, minutes, log)
-    cells = h3_density(iso, resolution, boundary(log), log)
+    key = f"{category}|{costing}|{minutes:g}"
+    iso = isochrones_cached(key, pts, costing, minutes, log)
+    cells = h3_density_cached(f"{key}|{resolution}", iso, resolution, boundary(log), log)
     bld = buildings_scored(cells, iso["name"], log=log)
     return pts, iso, cells, bld
 
@@ -356,6 +442,7 @@ def pack(bld: gpd.GeoDataFrame, rgba: np.ndarray, names: bool = True) -> bytes:
     ring = pa.ListArray.from_arrays(pa.array(ring_off, pa.int32()), xy, type=pa.list_(pa.field("vertices", xy.type, nullable=False)))
     poly = pa.ListArray.from_arrays(pa.array(np.arange(len(rings) + 1, dtype=np.int32), pa.int32()), ring, type=pa.list_(pa.field("rings", ring.type, nullable=False)))
     dens = bld["poi_density"].to_numpy(np.int32)[fid]
+    nta = (bld["nta"].to_numpy(np.int8) if "nta" in bld else np.full(len(bld), -1, np.int8))[fid]
     idl = bld["poi_ids"].to_numpy(object)[fid] if "poi_ids" in bld else [[] for _ in fid]
     ids = pa.array([list(map(int, v)) for v in idl], pa.list_(pa.int32()))
     # with names=False the page builds the names from `ids` and places_json, which is far smaller than a string per part
@@ -370,9 +457,10 @@ def pack(bld: gpd.GeoDataFrame, rgba: np.ndarray, names: bool = True) -> bytes:
             pa.field("ids", ids.type),
             pa.field("rgba", col.type),
             pa.field("elev", pa.float32()),
+            pa.field("nta", pa.int8()),
         ]
     )
-    batch = pa.record_batch([poly, pa.array(fid.astype(np.int32), pa.int32()), pa.array(dens, pa.int32()), pa.array(names_, pa.string()), ids, col, pa.array(dens.astype(np.float32), pa.float32())], schema=schema)
+    batch = pa.record_batch([poly, pa.array(fid.astype(np.int32), pa.int32()), pa.array(dens, pa.int32()), pa.array(names_, pa.string()), ids, col, pa.array(dens.astype(np.float32), pa.float32()), pa.array(nta, pa.int8())], schema=schema)
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, schema) as wr:
         wr.write_batch(batch)
