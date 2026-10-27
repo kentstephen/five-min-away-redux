@@ -1,6 +1,6 @@
 """Data for Five Minutes Away: Overture places and buildings read with DuckDB, isochrones from a local Valhalla graph,
 walk-shed counts on H3 cells, and the cells clipped to the neighborhoods (North Brooklyn: Greenpoint, the three
-Williamsburg NTAs, both Bedford-Stuyvesant NTAs and both Bushwick NTAs).
+Williamsburg NTAs, Fort Greene, Clinton Hill, both Bedford-Stuyvesant NTAs and both Bushwick NTAs).
 
 Everything read from the network is cached under data/cache/ so the notebook restarts fast.
 """
@@ -31,12 +31,16 @@ NTAS = {
     "BK0102": "Williamsburg",
     "BK0103": "South Williamsburg",
     "BK0104": "East Williamsburg",
+    "BK0203": "Fort Greene",
+    "BK0204": "Clinton Hill",
     "BK0301": "Bedford-Stuyvesant (West)",
     "BK0302": "Bedford-Stuyvesant (East)",
     "BK0401": "Bushwick (West)",
     "BK0402": "Bushwick (East)",
 }
 PLACE_NAME = "North Brooklyn"
+# cache file suffix: the NTA codes, so a changed neighborhood list reads a fresh box instead of reusing an old one
+AREA_KEY = "nb" + str(len(NTAS))
 # Places and buildings are read for the NTAs' box padded by about 1.5 km, so places just outside count toward walks inside.
 PAD_LON, PAD_LAT = 0.018, 0.014
 
@@ -96,7 +100,7 @@ def places_path(area=None, log=print) -> Path:
         "ST_X(geometry) AS lon, ST_Y(geometry) AS lat "
         f"FROM read_parquet('{S3}/theme=places/type=place/*.parquet') WHERE {_box_sql(area)}"
     )
-    return _cached_parquet("places_nb.parquet", q, log)
+    return _cached_parquet(f"places_{AREA_KEY}.parquet", q, log)
 
 
 def buildings_path(area=None, log=print) -> Path:
@@ -106,13 +110,13 @@ def buildings_path(area=None, log=print) -> Path:
         "SELECT id, subtype, class, height, num_floors, geometry "
         f"FROM read_parquet('{S3}/theme=buildings/type=building/*.parquet') WHERE {_box_sql(area)}"
     )
-    return _cached_parquet("buildings_nb.parquet", q, log)
+    return _cached_parquet(f"buildings_{AREA_KEY}.parquet", q, log)
 
 
 def boundary(log=print) -> shapely.Geometry:
     """The NTAs in NTAS from NYC Open Data (2020 NTAs, dataset 9nt8-h7nd), dissolved into one polygon."""
     CACHE.mkdir(parents=True, exist_ok=True)
-    out = CACHE / "ntas.geojson"
+    out = CACHE / f"ntas_{AREA_KEY}.geojson"
     if not out.exists():
         import urllib.parse
         import urllib.request
@@ -121,7 +125,7 @@ def boundary(log=print) -> shapely.Geometry:
         url = "https://data.cityofnewyork.us/resource/9nt8-h7nd.geojson?" + urllib.parse.urlencode({"$where": where, "$select": "ntaname,nta2020,the_geom"})
         with urllib.request.urlopen(url, timeout=60) as r:
             out.write_bytes(r.read())
-        log("ntas.geojson: read from NYC Open Data")
+        log(f"{out.name}: read from NYC Open Data")
     fc = json.loads(out.read_text())
     got = {f["properties"]["nta2020"] for f in fc["features"]}
     if got != set(NTAS):
@@ -167,6 +171,8 @@ def actor():
             cfg = json.loads(VALHALLA_CONFIG.read_text())
             cfg["mjolnir"]["tile_extract"] = ""
             cfg["mjolnir"]["traffic_extract"] = ""
+            for k in ("mjolnir", "loki", "thor", "odin"):
+                cfg.setdefault(k, {})["logging"] = {"type": "", "long_request": 1e9}
             _actor["actor"] = valhalla.Actor(cfg)
     return _actor["actor"]
 
@@ -199,11 +205,52 @@ def isochrones(df: pd.DataFrame, costing: str = "pedestrian", minutes: float = 5
     return out
 
 
+def _decode6(shape: str) -> list[list[float]]:
+    """Valhalla's encoded polyline (precision 6) as [lon, lat] pairs."""
+    out, i, lat, lon = [], 0, 0, 0
+    while i < len(shape):
+        for k in (0, 1):
+            res, shift = 0, 0
+            while True:
+                b = ord(shape[i]) - 63
+                i += 1
+                res |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            d = ~(res >> 1) if res & 1 else res >> 1
+            if k == 0:
+                lat += d
+            else:
+                lon += d
+        out.append([lon / 1e6, lat / 1e6])
+    return out
+
+
+def routes(origin: tuple[float, float], targets: pd.DataFrame, costing: str = "pedestrian", log=print) -> list[dict]:
+    """The route from one point (lon, lat) to each target row (lon, lat, name): {"path": [[lon, lat], ...],
+    "minutes", "meters", "name"} per target that the router can reach."""
+    a = actor()
+    t = time.time()
+    out = []
+    for lon, lat, name in zip(targets["lon"].to_numpy(), targets["lat"].to_numpy(), targets["name"].fillna("").to_numpy()):
+        try:
+            r = a.route({"locations": [{"lon": origin[0], "lat": origin[1]}, {"lon": float(lon), "lat": float(lat)}], "costing": costing, "units": "kilometers"})
+            trip = r["trip"]
+            path = [p for leg in trip["legs"] for p in _decode6(leg["shape"])]
+            out.append({"path": path, "minutes": trip["summary"]["time"] / 60, "meters": trip["summary"]["length"] * 1000, "name": str(name)})
+        except Exception as e:
+            log(f"route to ({lon:.5f}, {lat:.5f}) failed: {e}")
+    log(f"{len(out)} of {len(targets)} {costing} routes in {time.time() - t:.1f} s")
+    return out
+
+
 def h3_density(iso: gpd.GeoDataFrame, resolution: int = 11, clip: shapely.Geometry | None = None, log=print) -> gpd.GeoDataFrame:
-    """H3 cells covered by the isochrones: how many places reach each cell (poi_density) and which (poi_names).
+    """H3 cells covered by the isochrones: how many places reach each cell (poi_density) and which (poi_names, and
+    poi_ids: row indexes into `iso`).
     With `clip`, cells are cut to that polygon the way the old UDF overlaid the Bushwick boundary."""
     t = time.time()
-    df = pd.DataFrame({"name": iso["name"].fillna("").to_numpy(), "wkt": shapely.to_wkt(iso.geometry.to_numpy())})
+    df = pd.DataFrame({"pid": np.arange(len(iso), dtype=np.int32), "name": iso["name"].fillna("").to_numpy(), "wkt": shapely.to_wkt(iso.geometry.to_numpy())})
     con = connection()
     con.register("iso", df)
     clip_sql = ""
@@ -217,12 +264,13 @@ def h3_density(iso: gpd.GeoDataFrame, resolution: int = 11, clip: shapely.Geomet
         clip_sql = ", ST_AsWKB(ST_GeomFromText(h3_cell_to_boundary_wkt(hex))) AS geom FROM cells"
     q = f"""
     WITH to_cells AS (
-      SELECT unnest(h3_polygon_wkt_to_cells(wkt, {resolution})) AS hex, name FROM iso
+      SELECT unnest(h3_polygon_wkt_to_cells(wkt, {resolution})) AS hex, pid, name FROM iso
     ), cells AS (
-      SELECT hex, count(*)::INTEGER AS poi_density, string_agg(DISTINCT name, ', ' ORDER BY name) AS poi_names
+      SELECT hex, count(*)::INTEGER AS poi_density, string_agg(DISTINCT name, ', ' ORDER BY name) AS poi_names,
+             list(DISTINCT pid) AS poi_ids
       FROM to_cells GROUP BY hex
     )
-    SELECT h3_h3_to_string(hex) AS hex, poi_density, poi_names {clip_sql}
+    SELECT h3_h3_to_string(hex) AS hex, poi_density, poi_names, poi_ids {clip_sql}
     """
     t_ = con.sql(q).to_arrow_table()
     con.unregister("iso")
@@ -233,39 +281,49 @@ def h3_density(iso: gpd.GeoDataFrame, resolution: int = 11, clip: shapely.Geomet
     return out
 
 
-def buildings_scored(cells: gpd.GeoDataFrame, area=None, log=print) -> gpd.GeoDataFrame:
-    """Buildings that touch a cell, each with the highest poi_density of the cells it touches and the union of their names."""
+def buildings_scored(cells: gpd.GeoDataFrame, names: pd.Series | None = None, area=None, log=print) -> gpd.GeoDataFrame:
+    """Buildings that touch a cell, each with the union of the places over the cells it touches: poi_ids (row indexes
+    into the isochrone frame), poi_names, and poi_density = how many distinct places that is."""
     t = time.time()
     p = buildings_path(area, log)
     con = connection()
-    con.register("cells", pd.DataFrame({"hex": cells["hex"], "poi_density": cells["poi_density"], "poi_names": cells["poi_names"], "wkt": shapely.to_wkt(cells.geometry.to_numpy())}))
+    con.register("cells", pd.DataFrame({"hex": cells["hex"], "poi_ids": cells["poi_ids"], "wkt": shapely.to_wkt(cells.geometry.to_numpy())}))
     q = f"""
-    WITH c AS (SELECT hex, poi_density, poi_names, ST_GeomFromText(wkt) AS g FROM cells),
+    WITH c AS (SELECT hex, poi_ids, ST_GeomFromText(wkt) AS g FROM cells),
     b AS (SELECT id, subtype, class, height, num_floors, geometry AS g FROM read_parquet('{p}')),
     j AS (
       SELECT b.id, any_value(b.subtype) AS subtype, any_value(b.class) AS class, any_value(b.height) AS height,
              any_value(b.num_floors) AS num_floors, any_value(b.g) AS g,
-             max(c.poi_density)::INTEGER AS poi_density, string_agg(DISTINCT c.poi_names, ', ') AS poi_names
+             list_sort(list_distinct(flatten(list(c.poi_ids)))) AS poi_ids
       FROM b JOIN c ON ST_Intersects(b.g, c.g) GROUP BY b.id
     )
-    SELECT id, subtype, class, height, num_floors, poi_density, poi_names, ST_AsWKB(g) AS geom FROM j
+    SELECT id, subtype, class, height, num_floors, poi_ids, len(poi_ids)::INTEGER AS poi_density, ST_AsWKB(g) AS geom FROM j
     """
     t_ = con.sql(q).to_arrow_table()
     con.unregister("cells")
     geom = shapely.from_wkb(t_.column("geom").to_pylist())
     out = gpd.GeoDataFrame(t_.drop_columns(["geom"]).to_pandas(), geometry=geom, crs="EPSG:4326")
-    # poi_names can hold a name twice when two cells list it; keep each once
-    out["poi_names"] = [", ".join(sorted(set(s.split(", ")))) if s else "" for s in out["poi_names"].fillna("")]
+    nm = names.fillna("").to_numpy(object) if names is not None else None
+    out["poi_names"] = [", ".join(sorted({str(nm[i]) for i in ids} - {""})) if nm is not None else "" for ids in out["poi_ids"]]
     log(f"{len(out)} buildings scored in {time.time() - t:.1f} s")
     return out
 
 
 def run(category="Coffee Shop", costing="pedestrian", minutes=5, resolution=11, log=print):
-    """The whole chain: places -> isochrones -> cells clipped to the NTAs -> scored buildings."""
+    """The whole chain: places -> isochrones -> cells clipped to the NTAs -> scored buildings. The last few results are
+    kept, so asking again with the same knobs (the page reloading, a click) costs nothing."""
+    return _run(category, costing, int(minutes), int(resolution))
+
+
+import functools
+
+
+@functools.lru_cache(maxsize=6)
+def _run(category, costing, minutes, resolution, log=print):
     pts = places(category, log=log)
     iso = isochrones(pts, costing, minutes, log)
     cells = h3_density(iso, resolution, boundary(log), log)
-    bld = buildings_scored(cells, log=log)
+    bld = buildings_scored(cells, iso["name"], log=log)
     return pts, iso, cells, bld
 
 
@@ -280,9 +338,10 @@ if __name__ == "__main__":
     print(bld.head(3)[["subtype", "class", "poi_density", "poi_names"]])
 
 
-def pack(bld: gpd.GeoDataFrame, rgba: np.ndarray) -> bytes:
+def pack(bld: gpd.GeoDataFrame, rgba: np.ndarray, names: bool = True) -> bytes:
     """Arrow IPC stream for the page: a geoarrow.polygon per building part (its exterior ring), `fid` the building's row,
-    `density`, `names`, `rgba` (4 x uint8 per part) and `elev` (float32, the density)."""
+    `density`, `names`, `ids` (list<int32>: rows of the places frame whose sheds reach it), `rgba` (4 x uint8 per part)
+    and `elev` (float32, the density)."""
     import pyarrow as pa
 
     geoms = bld.geometry.to_numpy()
@@ -297,7 +356,10 @@ def pack(bld: gpd.GeoDataFrame, rgba: np.ndarray) -> bytes:
     ring = pa.ListArray.from_arrays(pa.array(ring_off, pa.int32()), xy, type=pa.list_(pa.field("vertices", xy.type, nullable=False)))
     poly = pa.ListArray.from_arrays(pa.array(np.arange(len(rings) + 1, dtype=np.int32), pa.int32()), ring, type=pa.list_(pa.field("rings", ring.type, nullable=False)))
     dens = bld["poi_density"].to_numpy(np.int32)[fid]
-    names = bld["poi_names"].fillna("").to_numpy(object)[fid]
+    idl = bld["poi_ids"].to_numpy(object)[fid] if "poi_ids" in bld else [[] for _ in fid]
+    ids = pa.array([list(map(int, v)) for v in idl], pa.list_(pa.int32()))
+    # with names=False the page builds the names from `ids` and places_json, which is far smaller than a string per part
+    names_ = bld["poi_names"].fillna("").to_numpy(object)[fid] if names else np.full(len(fid), "", object)
     col = pa.FixedSizeListArray.from_arrays(pa.array(np.asarray(rgba, np.uint8)[fid].ravel(), pa.uint8()), 4)
     schema = pa.schema(
         [
@@ -305,12 +367,18 @@ def pack(bld: gpd.GeoDataFrame, rgba: np.ndarray) -> bytes:
             pa.field("fid", pa.int32()),
             pa.field("density", pa.int32()),
             pa.field("names", pa.string()),
+            pa.field("ids", ids.type),
             pa.field("rgba", col.type),
             pa.field("elev", pa.float32()),
         ]
     )
-    batch = pa.record_batch([poly, pa.array(fid.astype(np.int32), pa.int32()), pa.array(dens, pa.int32()), pa.array(names, pa.string()), col, pa.array(dens.astype(np.float32), pa.float32())], schema=schema)
+    batch = pa.record_batch([poly, pa.array(fid.astype(np.int32), pa.int32()), pa.array(dens, pa.int32()), pa.array(names_, pa.string()), ids, col, pa.array(dens.astype(np.float32), pa.float32())], schema=schema)
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, schema) as wr:
         wr.write_batch(batch)
     return sink.getvalue().to_pybytes()
+
+
+def places_json(iso: pd.DataFrame) -> str:
+    """The places as the page needs them for lighting points: [[lon, lat, name], ...] in `poi_ids` order."""
+    return json.dumps([[round(float(x), 6), round(float(y), 6), str(n)] for x, y, n in zip(iso["lon"], iso["lat"], iso["name"].fillna(""))])

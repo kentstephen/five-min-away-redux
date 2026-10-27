@@ -38,7 +38,7 @@ def _(anywidget, fivemin, json, mo, pathlib, traitlets):
         config = traitlets.Unicode("{}").tag(sync=True)
         data = traitlets.Bytes(b"").tag(sync=True)
 
-    HOME = {"lon": -73.935, "lat": 40.700, "zoom": 12.3, "pitch": 55, "bearing": 0}
+    HOME = {"lon": -73.942, "lat": 40.706, "zoom": 12.1, "pitch": 55, "bearing": 0}
     page = mo.ui.anywidget(
         FiveMap(categories=json.dumps(list(fivemin.CATEGORIES)), config=json.dumps({"view": HOME, "area": fivemin.PLACE_NAME, "busy": True}))
     )

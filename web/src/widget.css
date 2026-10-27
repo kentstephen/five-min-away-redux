@@ -43,3 +43,7 @@
 
 /* a light basemap: the page's background follows it so the edges do not flash dark on resize */
 .fm.light { background: #e8e6e0; }
+
+/* flat mode: footprints only, no height; the tooltip notes the routes once they are drawn */
+.fm.flat .hgt { display: none; }
+.fm .tip .routes { margin-top: 8px; font-size: 11.5px; color: #d9f3a7; }

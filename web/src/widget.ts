@@ -12,6 +12,7 @@ import maplibreCss from "maplibre-gl/dist/maplibre-gl.css?inline";
 import maplibreWorker from "maplibre-gl/dist/maplibre-gl-worker.mjs?raw";
 import { MapLibreOverlay } from "@deck.gl/maplibre";
 import { GeoArrowPolygonLayer } from "@geoarrow/deck.gl-layers";
+import { PathLayer, PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
 import * as arrow from "apache-arrow";
 import css from "./widget.css?inline";
 
@@ -19,11 +20,17 @@ type Model = {
   get: (k: string) => unknown;
   set: (k: string, v: unknown) => void;
   save_changes: () => void;
-  on: (ev: string, cb: () => void) => void;
-  off: (ev: string, cb: () => void) => void;
+  on: (ev: string, cb: (...a: unknown[]) => void) => void;
+  off: (ev: string, cb: (...a: unknown[]) => void) => void;
+  send: (msg: unknown) => void;
 };
 type Cfg = { ramp?: string[]; vmax?: number; buildings?: number; places?: number; plural?: string; minutes?: number; area?: string;
-  view?: { lon: number; lat: number; zoom: number; pitch: number; bearing: number }; busy?: boolean };
+  view?: { lon: number; lat: number; zoom: number; pitch: number; bearing: number }; busy?: boolean; flat?: boolean };
+// flat mode: a footprint hovered or locked dims the others, lights the places that reach it, and once locked draws the
+// routes from it to them. All page side, except the routes, which the kernel answers over the custom message channel.
+type Place = [number, number, string];
+type Route = { path: [number, number][]; minutes: number; meters: number; name: string };
+const LIT: [number, number, number] = [217, 243, 167]; // the ramp's light end, the card's accent
 
 const STYLES: [string, string][] = [
   ["dark", "https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json"],
@@ -114,6 +121,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   const showCfg = () => {
     const c = cfg();
     if (c.area) $(".area").textContent = c.area;
+    root.classList.toggle("flat", !!c.flat);
     if (!c.ramp) return;
     $(".ramp").style.background = `linear-gradient(90deg, ${c.ramp.join(",")})`;
     $(".hi").textContent = `${c.vmax} within reach`;
@@ -137,6 +145,26 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   let gen = 0; // a new layer id per data load: the GeoArrow layer trips on new accessors under an old id
   let dataType = "none";
   const col = <T>(name: string, i: number): T => table!.getChild(name)!.get(i) as T;
+  let places: Place[] = [];
+  const loadPlaces = () => { try { places = JSON.parse((model.get("places") as string) || "[]"); } catch { places = []; } };
+  loadPlaces();
+  // the rows of `places` whose sheds reach a part, and the parts of a building (parts of one building sit together)
+  const idsOf = (i: number): number[] => { const v = table?.getChild("ids")?.get(i) as { toArray?: () => ArrayLike<number> } | null; return v && v.toArray ? Array.from(v.toArray()) : []; };
+  const partsOf = (i: number): number[] => {
+    const f = col<number>("fid", i), out = [i];
+    for (let j = i - 1; j >= 0 && col<number>("fid", j) === f; j--) out.unshift(j);
+    for (let j = i + 1; j < table!.numRows && col<number>("fid", j) === f; j++) out.push(j);
+    return out;
+  };
+  const ringsOf = (i: number): [number, number][][] => {
+    const g = table!.getChild("geometry")!.get(i) as { length: number; get: (r: number) => { length: number; get: (k: number) => { get: (d: number) => number } } };
+    const rings: [number, number][][] = [];
+    for (let r = 0; r < g.length; r++) { const ring = g.get(r), pts: [number, number][] = []; for (let k = 0; k < ring.length; k++) { const q = ring.get(k); pts.push([q.get(0), q.get(1)]); } rings.push(pts); }
+    return rings;
+  };
+  let hot: number | null = null; // the part hovered or locked, in flat mode
+  let routes: Route[] = [];
+  let routesFor: number | null = null; // the fid the routes answer
 
   // ---- the tooltip: hover follows the cursor, a click pins it (click again, or Esc, releases)
   const tip = $(".tip");
@@ -154,13 +182,17 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
     if (!table) return;
     const c = cfg();
     const n = col<number>("density", index);
-    const names = (col<string>("names", index) || "").split(", ").filter(Boolean);
+    const ids = idsOf(index);
+    const names = places.length && ids.length ? ids.map((i) => places[i]?.[2] || "").filter(Boolean).sort((a, b) => a.localeCompare(b)) : (col<string>("names", index) || "").split(", ").filter(Boolean);
+    const fid = col<number>("fid", index);
+    const rt = c.flat && pinned !== null ? (routesFor === fid && routes.length ? `${routes.length} routes drawn, ${Math.min(...routes.map((r) => r.minutes)).toFixed(0)} to ${Math.max(...routes.map((r) => r.minutes)).toFixed(0)} min` : "finding the routes") : "";
     const shown = names.slice(0, NAMES_SHOWN), more = names.length - shown.length;
     const unit = n === 1 ? (c.plural || "places").replace(/ies$/, "y").replace(/s$/, "") : c.plural || "places";
     tip.innerHTML =
       `<div class="n">${n}<small>${esc(unit)} within a ${c.minutes ?? 5} minute ${(model.get("costing") as string) === "bicycle" ? "bike ride" : "walk"}</small></div>` +
       `<ul class="names">${shown.map((s) => `<li>${esc(s)}</li>`).join("")}${more > 0 ? `<li class="more">and ${more} more</li>` : ""}</ul>` +
-      (pinned === null ? `<div class="hint">click to keep</div>` : `<div class="hint">click again or Esc to release</div>`);
+      (rt ? `<div class="routes">${esc(rt)}</div>` : "") +
+      (pinned === null ? `<div class="hint">click to ${c.flat ? "lock and draw the routes" : "keep"}</div>` : `<div class="hint">click again or Esc to release</div>`);
     tip.classList.add("on");
     tip.classList.toggle("pinned", pinned !== null);
     place(x, y);
@@ -169,42 +201,113 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
 
   const layers = () => {
     if (!table || !batch) return [];
-    return [
+    const flat = !!cfg().flat;
+    const lit = flat && hot !== null;
+    const out: unknown[] = [
       new GeoArrowPolygonLayer({
         id: `buildings-${gen}`,
         data: batch,
         getPolygon: batch.getChild("geometry")!.data[0] as never,
         getFillColor: batch.getChild("rgba")!.data[0] as never,
         getElevation: batch.getChild("elev")!.data[0] as never,
-        elevationScale: elevScale,
-        extruded: true,
+        elevationScale: flat ? 0 : elevScale,
+        extruded: !flat,
         filled: true,
         stroked: false,
-        opacity: 0.95,
+        opacity: lit ? 0.22 : 0.95,
         pickable: true,
-        autoHighlight: true,
+        autoHighlight: !flat,
         highlightColor: [255, 255, 255, 110],
         earcutWorkerUrl: null,
         _validate: false,
       } as never),
     ];
+    if (!lit) return out;
+    const parts = partsOf(hot!);
+    const rgba = (table.getChild("rgba")!.get(hot!) as { toArray: () => ArrayLike<number> }).toArray();
+    out.push(
+      new PolygonLayer({
+        id: "hot-building",
+        data: parts.map((i) => ({ rings: ringsOf(i) })),
+        getPolygon: (d: { rings: [number, number][][] }) => d.rings,
+        getFillColor: [rgba[0], rgba[1], rgba[2], 255],
+        getLineColor: [...LIT, 255],
+        lineWidthMinPixels: 1.5,
+        lineWidthMaxPixels: 3,
+        getLineWidth: 2,
+        filled: true,
+        stroked: true,
+        pickable: false,
+      }),
+    );
+    if (pinned !== null && routesFor === col<number>("fid", hot!) && routes.length) {
+      out.push(
+        new PathLayer({
+          id: "routes",
+          data: routes,
+          getPath: (d: Route) => d.path,
+          getColor: [...LIT, 210],
+          getWidth: 4,
+          widthUnits: "meters",
+          widthMinPixels: 2,
+          widthMaxPixels: 7,
+          capRounded: true,
+          jointRounded: true,
+          pickable: false,
+        }),
+      );
+    }
+    out.push(
+      new ScatterplotLayer({
+        id: "hot-places",
+        data: idsOf(hot!).map((i) => places[i]).filter(Boolean),
+        getPosition: (d: Place) => [d[0], d[1]],
+        getFillColor: [...LIT, 255],
+        getRadius: 14,
+        radiusUnits: "meters",
+        radiusMinPixels: 4.5,
+        radiusMaxPixels: 11,
+        stroked: false,
+        pickable: false,
+      }),
+    );
+    return out;
   };
   type Pick = { index: number; x: number; y: number; layer?: { id: string } | null };
+  const setHot = (i: number | null) => { if (i === hot) return; hot = i; if (cfg().flat) draw(); };
   const onHover = (info: Pick) => {
     if (pinned !== null) return;
-    if (info.index >= 0 && info.layer) { last = { index: info.index, x: info.x, y: info.y }; showTip(info.index, info.x, info.y); }
-    else { last = null; hideTip(); }
+    if (info.index >= 0 && info.layer && info.layer.id.startsWith("buildings-")) { last = { index: info.index, x: info.x, y: info.y }; showTip(info.index, info.x, info.y); setHot(info.index); }
+    else { last = null; hideTip(); setHot(null); }
   };
+  // a lock asks the kernel for the routes from that building; the answer comes back on the custom channel
+  const askRoutes = (index: number) => {
+    const fid = col<number>("fid", index);
+    routes = []; routesFor = null;
+    try { model.send({ pin: fid }); } catch (e) { console.error("five-min: could not ask for routes", e); }
+  };
+  const release = () => { pinned = null; routes = []; routesFor = null; hideTip(); setHot(null); try { model.send({ pin: -1 }); } catch { /* no channel */ } };
+  model.on("msg:custom", (msg: unknown) => {
+    const m = msg as { pin?: number; routes?: Route[] } | null;
+    if (!m || typeof m.pin !== "number" || !table) return;
+    if (pinned === null || col<number>("fid", pinned) !== m.pin) return; // an answer for a building no longer locked
+    routes = m.routes || []; routesFor = m.pin;
+    if (last) showTip(pinned, last.x, last.y);
+    draw();
+  });
   const clicks: unknown[] = [];
   const onClick = (info: Pick) => {
     clicks.push({ index: info.index, layer: info.layer?.id ?? null, x: info.x, y: info.y });
-    if (info.index < 0 || !info.layer) { if (pinned !== null) { pinned = null; hideTip(); } return; }
-    if (pinned === info.index) { pinned = null; showTip(info.index, info.x, info.y); return; }
-    pinned = info.index; showTip(info.index, info.x, info.y);
+    const onBuilding = info.index >= 0 && !!info.layer && info.layer.id.startsWith("buildings-");
+    if (!onBuilding) { if (pinned !== null) release(); return; }
+    if (pinned === info.index) { release(); last = { index: info.index, x: info.x, y: info.y }; showTip(info.index, info.x, info.y); setHot(info.index); return; }
+    pinned = info.index; last = { index: info.index, x: info.x, y: info.y }; hot = info.index;
+    if (cfg().flat) askRoutes(info.index);
+    showTip(info.index, info.x, info.y); draw();
   };
   let lastClick = 0;
   const onClickOnce = (info: Pick) => { const now = performance.now(); if (now - lastClick < 200) return; lastClick = now; onClick(info); };
-  const draw = () => overlay.setProps({ layers: layers(), onHover: onHover as never, onClick: onClickOnce as never });
+  const draw = () => overlay.setProps({ layers: layers() as never, onHover: onHover as never, onClick: onClickOnce as never });
   type DeckLike = { _onPointerDown: (e: unknown) => void; _onEvent: (e: unknown) => void };
   const deck = () => (overlay as unknown as { _deck?: DeckLike })._deck;
   map.on("mousedown", (e: maplibregl.MapMouseEvent) => deck()?._onPointerDown({ type: "pointerdown", offsetCenter: e.point, srcEvent: e.originalEvent }));
@@ -229,13 +332,14 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
     } catch (e) {
       console.error("five-min: could not read the buildings", e); table = null; batch = null;
     }
-    pinned = null; hideTip();
+    pinned = null; hot = null; routes = []; routesFor = null; hideTip();
     draw();
   };
   // the buildings may have been sent before this page existed: if none arrived, ask the kernel once
   setTimeout(() => { if (!table) { model.set("ask", String(Date.now())); model.save_changes(); } }, 2500);
   map.on("load", () => { loadData(); showCfg(); });
   model.on("change:data", loadData);
+  model.on("change:places", () => { loadPlaces(); if (hot !== null) draw(); });
   model.on("change:config", showCfg);
   model.on("change:categories", cats);
 
@@ -270,7 +374,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
       const d = 80, dx = e.key === "ArrowLeft" ? -d : e.key === "ArrowRight" ? d : 0, dy = e.key === "ArrowUp" ? -d : e.key === "ArrowDown" ? d : 0;
       map.panBy([dx, dy], { duration: 200 });
     }
-    else if (e.key === "Escape") { if (pinned !== null) { pinned = null; hideTip(); } else if (st.fit && !fsOn()) { st.fit = false; sizes(); } }
+    else if (e.key === "Escape") { if (pinned !== null) release(); else if (st.fit && !fsOn()) { st.fit = false; sizes(); } }
   };
   const nextStyle = () => {
     styleI = (styleI + 1) % STYLES.length;
@@ -284,7 +388,7 @@ function render({ model, el }: { model: Model; el: HTMLElement }) {
   $(".kf").onclick = fullScreen;
   window.addEventListener("keydown", onKey);
   document.addEventListener("fullscreenchange", onFs);
-  (window as unknown as { _fm: unknown })._fm = { st, sizes, map, tableRows: () => table?.numRows ?? 0, pinned: () => pinned, scale: () => elevScale, style: () => STYLES[styleI][0], dataType: () => dataType, batch: () => batch, overlay, clicks };
+  (window as unknown as { _fm: unknown })._fm = { st, sizes, map, tableRows: () => table?.numRows ?? 0, pinned: () => pinned, hot: () => hot, send: (m: unknown) => model.send(m), routes: () => routes.length, places: () => places.length, scale: () => elevScale, style: () => STYLES[styleI][0], dataType: () => dataType, batch: () => batch, overlay, clicks };
   sizes();
   showCfg();
 
